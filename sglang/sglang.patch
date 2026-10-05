@@ -1,0 +1,1070 @@
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index d132c7b..e721d88 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -47,6 +47,72 @@ if TYPE_CHECKING:
+ logger = logging.getLogger(__name__)
+ 
+ 
++import os as _os
++
++_TEXT_OBS_WINDOW = int(_os.environ.get("SGLANG_TEXT_OBS_WINDOW", "0") or 0)
++# cache-aware masking: only re-mask when #observations hits a multiple of POLL (paper's `polling`);
++# between masking events the prompt prefix is unchanged, so the prefix cache keeps hitting.
++_TEXT_OBS_POLL = max(1, int(_os.environ.get("SGLANG_TEXT_OBS_POLL", "1") or 1))
++
++
++def _text_obs_mask(messages, keep):
++    def _text(c):
++        if c is None:
++            return ""
++        if isinstance(c, str):
++            return c
++        return "".join(getattr(p, "text", "") or "" for p in c)
++
++    obs = [i for i, m in enumerate(messages) if m.role == "tool"]
++    old = obs[: max(0, (len(obs) // _TEXT_OBS_POLL) * _TEXT_OBS_POLL - keep)]
++    removed = 0
++    for i in old:
++        txt = _text(messages[i].content)
++        ph = f"Old environment output: ({len(txt.splitlines())} lines omitted)"
++        if txt != ph:
++            removed += len(txt) - len(ph)
++            messages[i].content = ph
++    logger.info(
++        f"[TEXTMASK] request: {len(obs)} observations, kept last {len(obs) - len(old)}, "
++        f"masked {len(old)} -> removed {removed} chars"
++    )
++
++
++import hashlib as _hashlib
++
++_DP_STICKY = _os.environ.get("SGLANG_DP_STICKY", "0") == "1"
++_LOG_CONV = _os.environ.get("SGLANG_LOG_TTFT", "0") == "1"
++_CONV_SEEN = set()
++_DP_ASSIGN = {}  # agent key -> dp rank
++_DP_SEEN = {}  # agent key -> last request time
++
++
++def _dp_sticky_rank(messages, dp_size):
++    # agent key = first user message (the task text). A new agent goes to the rank with the fewest
++    # ACTIVE agents (seen in the last 300s), so one-off requests (e.g. a startup call with a different
++    # first message) do not count as load for long.
++    import time as _time
++
++    first = next((m for m in messages if m.role == "user"), None)
++    c = first.content if first is not None else ""
++    if not isinstance(c, str):
++        c = "".join(getattr(p, "text", "") or "" for p in c)
++    key = _hashlib.md5(c[:2000].encode("utf-8", "ignore")).hexdigest()   # task text only: stable when an LLM summary is appended later
++    now = _time.time()
++    r = _DP_ASSIGN.get(key)
++    if r is None:
++        load = [0] * dp_size
++        for k, v in _DP_ASSIGN.items():
++            if now - _DP_SEEN.get(k, 0) < 300:
++                load[v] += 1
++        r = min(range(dp_size), key=lambda i: load[i])
++        _DP_ASSIGN[key] = r
++        load[r] += 1
++        logger.info(f"[DPSTICKY] new agent {key[:8]} (msgs={len(messages)}) -> dp rank {r} (active agents per rank {load})")
++    _DP_SEEN[key] = now
++    return r
++
++
+ class OpenAIServingChat(OpenAIServingBase):
+     """Handler for /v1/chat/completions requests"""
+ 
+@@ -152,6 +218,28 @@ class OpenAIServingChat(OpenAIServingBase):
+             customer_labels=customer_labels,
+         )
+ 
++        # Conversation log for per-agent metrics (recomputed tokens): request id -> agent key (first user message)
++        if _LOG_CONV:
++            import time as _t, uuid as _uuid
++            if adapted_request.rid is None:
++                adapted_request.rid = _uuid.uuid4().hex
++            _f = next((m for m in request.messages if m.role == "user"), None)
++            _c = _f.content if _f is not None else ""
++            if not isinstance(_c, str):
++                _c = "".join(getattr(p, "text", "") or "" for p in _c)
++            _key = _hashlib.md5(_c[:2000].encode('utf-8', 'ignore')).hexdigest()[:12]   # same task key as sticky routing
++            logger.info(f"[CONV] t={_t.time():.3f} rid={adapted_request.rid} key={_key} tools={int(bool(request.tools))}")
++            if request.tools and _key not in _CONV_SEEN:   # once per conversation: text to map the key to its task
++                _CONV_SEEN.add(_key)
++                logger.info("[CONVTEXT] key=%s text=%s", _key, _c[:4000].replace("\n", " "))
++
++        # DP-attention: keep each agent on one DP rank so its prefix stays in that rank's radix cache.
++        if _DP_STICKY:
++            _dp = getattr(self.tokenizer_manager.server_args, "dp_size", 1) or 1
++            # only agent turns (they carry tools); one-off calls like OpenHands title generation use round robin
++            if _dp > 1 and adapted_request.data_parallel_rank is None and request.tools:
++                adapted_request.data_parallel_rank = _dp_sticky_rank(request.messages, _dp)
++
+         return adapted_request, request
+ 
+     def _process_messages(
+@@ -170,6 +258,11 @@ class OpenAIServingChat(OpenAIServingBase):
+ 
+         tool_call_constraint = None
+ 
++        # Text-level observation masking (Complexity Trap / SWE-agent LastNObservations):
++        # keep the last K tool observations verbatim, replace older ones with a placeholder.
++        if _TEXT_OBS_WINDOW > 0:
++            _text_obs_mask(request.messages, _TEXT_OBS_WINDOW)
++
+         # Apply chat template and its stop strings
+         tools = None
+         if request.tools and request.tool_choice != "none":
+diff --git a/python/sglang/srt/function_call/mistral_detector.py b/python/sglang/srt/function_call/mistral_detector.py
+index 49767fd..ac69b8b 100644
+--- a/python/sglang/srt/function_call/mistral_detector.py
++++ b/python/sglang/srt/function_call/mistral_detector.py
+@@ -42,7 +42,25 @@ class MistralDetector(BaseFormatDetector):
+ 
+     def has_tool_call(self, text: str) -> bool:
+         """Check if the text contains a Mistral format tool call."""
+-        return self.bot_token in text
++        return self.bot_token in text or "[ARGS]" in text
++
++    def _parse_args_format(self, text: str, tools: List[Tool]) -> StreamingParseResult:
++        """Newer tekken format (Devstral-2507, Mistral Small 3.2): [TOOL_CALLS]name[ARGS]{json} [TOOL_CALLS]name2[ARGS]{json}"""
++        idx = text.find("[TOOL_CALLS]")
++        normal_text = text[:idx].strip() if idx != -1 else ""
++        dec, arr = json.JSONDecoder(strict=False), []   # strict=False: raw newlines/tabs inside strings
++        for m in re.finditer(r"\[TOOL_CALLS\]\s*([^\[\]\s]+)\s*\[ARGS\]", text):
++            s = text[m.end():].lstrip()
++            try:
++                args, _ = dec.raw_decode(s)
++            except json.JSONDecodeError:
++                try:   # repair lone backslashes such as \d or \s inside strings
++                    args, _ = dec.raw_decode(re.sub(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r"\\\\", s))
++                except json.JSONDecodeError as e:
++                    logger.warning(f"Failed to parse [ARGS] JSON for {m.group(1)}: {e}")
++                    continue
++            arr.append({"name": m.group(1), "arguments": args})
++        return StreamingParseResult(normal_text=normal_text, calls=self.parse_base_json(arr, tools) if arr else [])
+ 
+     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+         """
+@@ -52,6 +70,8 @@ class MistralDetector(BaseFormatDetector):
+         :param tools: List of available tools.
+         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+         """
++        if "[ARGS]" in text and self.bot_token not in text:
++            return self._parse_args_format(text, tools)
+         idx = text.find(self.bot_token)
+         normal_text = text[:idx].strip() if idx != -1 else text
+ 
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index a5b207c..ec63164 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -24,6 +24,82 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+ from sglang.global_config import global_config
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
++import os as _ds_os
++
++# DEADSLOT (ObsDrop): dropped positions point to dummy slot 0; remove them from the attended index list.
++_DS_FILTER = bool(_ds_os.environ.get("SGLANG_OBS_WINDOW") or _ds_os.environ.get("SGLANG_PRUNE_C"))
++
++
++def _ds_compact_inplace(kv_indptr, kv_indices, bs):
++    """Drop slot-0 entries in place (works for CUDA-graph fixed buffers). Rows that would become empty
++    (graph padding rows) keep their entries. Returns True if anything changed."""
++    n = int(kv_indptr[bs])
++    if n == 0:
++        return False
++    idx = kv_indices[:n]
++    keep = idx != 0
++    if bool(keep.all()):
++        return False
++    lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
++    seg = torch.repeat_interleave(torch.arange(bs, device=idx.device), lens)
++    kept = torch.zeros(bs, dtype=torch.int64, device=idx.device)
++    kept.scatter_add_(0, seg, keep.to(torch.int64))
++    keep = keep | (kept[seg] == 0)
++    new_lens = torch.zeros(bs, dtype=torch.int64, device=idx.device)
++    new_lens.scatter_add_(0, seg, keep.to(torch.int64))
++    comp = idx[keep]
++    kv_indices[: comp.numel()].copy_(comp)
++    kv_indptr[1 : bs + 1].copy_(torch.cumsum(new_lens, dim=0).to(kv_indptr.dtype))
++    return True
++
++
++# ---- fast ObsDrop: sync-free dead-slot compaction using CPU dead counts (set per forward by ForwardBatch.init_new) ----
++_DS_CUR = None
++_DS_VERIFY = _ds_os.environ.get("SGLANG_DS_VERIFY") == "1"
++
++
++def _ds_compact_fast(kv_indptr, kv_indices, bs, n_total, kind):
++    """Same result as _ds_compact_inplace, without GPU->CPU syncs. Returns (changed, indptr_cpu or None).
++    Real rows: live length = length - dead (dead slots of a request are fixed while it runs). Rows past the real
++    batch (CUDA-graph padding) keep all their entries. Falls back to the GPU filter when counts are unknown."""
++    cur = _DS_CUR
++    lens = None if cur is None else cur.get(kind)
++    dead = None if cur is None else cur.get("dead")
++    if dead is None or lens is None:
++        return _ds_compact_inplace(kv_indptr, kv_indices, bs), None
++    rb = min(len(dead), len(lens), bs)
++    if not any(dead[:rb]):
++        return False, None
++    real = [int(x) for x in lens[:rb]]
++    rest = int(n_total) - sum(real)
++    pad = bs - rb
++    pad_lens = []
++    if pad:
++        pad_lens = [rest // pad] * pad
++        pad_lens[-1] += rest - sum(pad_lens)
++    elif rest != 0:                                    # lengths do not add up: be safe
++        return _ds_compact_inplace(kv_indptr, kv_indices, bs), None
++    live = [l - int(d) for l, d in zip(real, dead[:rb])] + pad_lens
++    if _DS_VERIFY:
++        ref_ptr, ref_idx = kv_indptr[: bs + 1].clone(), kv_indices[: int(n_total) + 1].clone()
++        _ds_compact_inplace(ref_ptr, ref_idx, bs)
++    n = int(n_total)
++    idx = kv_indices[:n]
++    keep = idx != 0
++    if pad:
++        keep[sum(real):] = True                        # padding rows: never drop
++    pos = torch.cumsum(keep, 0) - 1
++    dest = torch.where(keep, pos, torch.full_like(pos, n))   # dropped entries go to the spare slot at index n
++    kv_indices.scatter_(0, dest, idx.clone())
++    indptr_cpu = torch.zeros(bs + 1, dtype=kv_indptr.dtype)
++    indptr_cpu[1:] = torch.cumsum(torch.tensor(live, dtype=torch.int64), 0).to(kv_indptr.dtype)
++    kv_indptr[1 : bs + 1].copy_(indptr_cpu[1:], non_blocking=True)
++    if _DS_VERIFY:
++        m = int(indptr_cpu[-1])
++        assert torch.equal(ref_ptr.cpu(), indptr_cpu), f"[DS-VERIFY] indptr {ref_ptr.cpu().tolist()} vs {indptr_cpu.tolist()}"
++        assert torch.equal(ref_idx[:m], kv_indices[:m]), "[DS-VERIFY] compacted indices differ"
++    return True, indptr_cpu
++
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
+ from sglang.srt.layers.radix_attention import AttentionType
+ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+@@ -347,10 +423,9 @@ class FlashInferAttnBackend(AttentionBackend):
+             )
+             self.decode_cuda_graph_metadata[bs] = decode_wrappers
+             self.forward_metadata = DecodeMetadata(decode_wrappers)
+-            for i in range(self.num_wrappers):
+-                decode_wrappers[i].begin_forward = partial(
+-                    fast_decode_plan, decode_wrappers[i]
+-                )
++            # SGLang's fast_decode_plan targets a newer FlashInfer plan() signature; the installed
++            # flashinfer 0.3.1 rejects it. Keep FlashInfer's own plan (reads the compacted indptr itself).
++            pass
+         elif forward_mode.is_target_verify():
+             prefill_wrappers = []
+             for i in range(self.num_wrappers):
+@@ -767,7 +842,7 @@ class FlashInferIndicesUpdaterDecode:
+                 kv_indices = wrapper._paged_kv_indices_buf
+             else:
+                 kv_indices = torch.empty(
+-                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
++                    paged_kernel_lens_sum + 1, dtype=torch.int32, device="cuda"  # +1: spare slot for _ds_compact_fast
+                 )
+ 
+             create_flashinfer_kv_indices_triton[(bs,)](
+@@ -791,9 +866,16 @@ class FlashInferIndicesUpdaterDecode:
+                 )
+             )
+ 
++        _ds_changed, _ds_indptr_cpu = (_ds_compact_fast(kv_indptr, kv_indices, bs, paged_kernel_lens_sum, "seq")
++                                       if (_DS_FILTER and spec_info is None) else (False, None))
++
+         global global_override_indptr_cpu
+         locally_override = False
+-        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
++        _ds_saved_override = global_override_indptr_cpu
++        if _ds_changed:
++            # the plan must see the compacted lengths, not seq_lens
++            global_override_indptr_cpu = _ds_indptr_cpu if _ds_indptr_cpu is not None else kv_indptr.cpu()
++        elif seq_lens_cpu is not None and global_override_indptr_cpu is None:
+             locally_override = True
+             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
+             global_override_indptr_cpu[0] = 0
+@@ -814,6 +896,8 @@ class FlashInferIndicesUpdaterDecode:
+ 
+         if locally_override:
+             global_override_indptr_cpu = None
++        if _ds_changed:
++            global_override_indptr_cpu = _ds_saved_override
+ 
+ 
+ class FlashInferIndicesUpdaterPrefill:
+@@ -1055,6 +1139,10 @@ class FlashInferIndicesUpdaterPrefill:
+                 )
+             )
+ 
++        # DEADSLOT: drop dead prefix positions from the paged (cached) part
++        if _DS_FILTER and spec_info is None:
++            _ds_compact_fast(kv_indptr, kv_indices, bs, paged_kernel_lens_sum, "prefix" if use_ragged else "seq")
++
+         # cached part
+         wrapper_paged.begin_forward(
+             qo_indptr,
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 806db89..b869270 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -46,6 +46,31 @@ class ForwardMetadata:
+     window_kv_offsets: torch.Tensor
+ 
+ 
++
++# DEADSLOT: dropped positions are redirected to slot 0. Remove them from the attention index list so
++# they are EXACTLY excluded (a sentinel key value cannot mask: q.k sign depends on q). Positions/RoPE
++# are unaffected (keys are stored post-RoPE; query positions come from seq_lens).
++import os as _ds_os
++_DS_FILTER = bool(_ds_os.environ.get("SGLANG_OBS_WINDOW") or _ds_os.environ.get("SGLANG_PRUNE_C"))
++
++
++def _ds_compact(kv_indptr, kv_indices, bs, lens_dtype, keep_empty_rows=False):
++    keep = kv_indices != 0
++    lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
++    if bool(keep.all()):
++        return kv_indptr, kv_indices, lens.to(lens_dtype)
++    seg = torch.repeat_interleave(torch.arange(bs, device=kv_indices.device), lens)
++    if keep_empty_rows:
++        # CUDA graph padding rows may point only at slot 0: never leave a row with zero entries
++        kept = torch.zeros(bs, dtype=torch.int64, device=kv_indices.device)
++        kept.scatter_add_(0, seg, keep.to(torch.int64))
++        keep = keep | (kept[seg] == 0)
++    new_lens = torch.zeros(bs, dtype=torch.int64, device=kv_indices.device)
++    new_lens.scatter_add_(0, seg, keep.to(torch.int64))
++    new_indptr = torch.zeros(bs + 1, dtype=kv_indptr.dtype, device=kv_indptr.device)
++    new_indptr[1:] = torch.cumsum(new_lens, dim=0)
++    return new_indptr, kv_indices[keep], new_lens.to(lens_dtype)
++
+ class TritonAttnBackend(AttentionBackend):
+     def __init__(
+         self,
+@@ -367,6 +392,13 @@ class TritonAttnBackend(AttentionBackend):
+             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+             num_kv_splits = None
+ 
++        if _DS_FILTER and kv_indices is not None and spec_info is None:
++            kv_indptr, kv_indices, _ds_lens = _ds_compact(
++                kv_indptr, kv_indices, kv_indptr.shape[0] - 1, forward_batch.seq_lens.dtype
++            )
++            if num_kv_splits is not None:
++                self.get_num_kv_splits(num_kv_splits, _ds_lens)
++
+         self.forward_metadata = ForwardMetadata(
+             attn_logits,
+             attn_lse,
+@@ -646,12 +678,25 @@ class TritonAttnBackend(AttentionBackend):
+                     self.get_num_kv_splits(
+                         window_num_kv_splits[:num_token], window_kv_lens[:bs]
+                     )
++                # DEADSLOT under CUDA graph replay: drop slot-0 entries IN PLACE in the graph's fixed buffers
++                # (the captured kernels read kv_indptr / kv_indices through their pointers), and size the
++                # kv splits from the compacted lengths.
++                _ds_lens = None
++                if _DS_FILTER:
++                    _n = int(kv_indptr[bs])
++                    _ni, _nk, _nl = _ds_compact(kv_indptr, kv_indices[:_n], bs, seq_lens.dtype, keep_empty_rows=True)
++                    if _nk.numel() != _n:
++                        _m = _nk.numel()
++                        kv_indices[:_m].copy_(_nk)
++                        kv_indptr.copy_(_ni)
++                        _ds_lens = _nl
+ 
+             else:
+                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
+                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+                 num_token = spec_info.kv_indptr.shape[0] - 1
+-            self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
++                _ds_lens = None
++            self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs] if _ds_lens is None else _ds_lens)
+ 
+         elif forward_mode.is_target_verify():
+             # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index b226b83..8f3d402 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -113,6 +113,63 @@ GLOBAL_SERVER_ARGS_KEYS = [
+ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+ 
+ logger = logging.getLogger(__name__)
++import os as _resid_os, time
++_LOG_RESID = bool(_resid_os.environ.get("SGLANG_OBS_WINDOW"))
++
++# Restore masking (ObsDrop + SGLANG_OBS_RESTORE_MASK=1): when an evicted conversation comes back, its old
++# observations (outside the K window, already dropped from the KV before the eviction) would be prefilled
++# again in full. Instead their content is replaced by a short placeholder, so the restore only recomputes
++# about the live part. The conversation keeps that rewrite for all later requests (same tokens -> prefix hits).
++_RM_ON = bool(_resid_os.environ.get("SGLANG_OBS_RESTORE_MASK")) and bool(_resid_os.environ.get("SGLANG_OBS_WINDOW"))
++_RM_K = int(_resid_os.environ.get("SGLANG_OBS_WINDOW") or 0)
++_RM_OPEN, _RM_CLOSE = (int(x) for x in _resid_os.environ.get("SGLANG_OBS_MARKERS", "151665,151666").split(","))  # observation open/close token ids
++_RM_PH = [int(x) for x in _resid_os.environ.get("SGLANG_OBS_PH", "198,18284,4573,2550,25,320,11263,6924,504,84648,6500,340").split(",")]  # "\nOld environment output: (dropped from KV cache)\n"
++_RM_MASKED = {}  # conversation key -> number of leading observations shown as placeholder
++
++
++def _rm_spans_slow(ids):
++    spans, i, n = [], 0, len(ids)
++    while i < n:
++        if ids[i] == _RM_OPEN:
++            j = i + 1
++            while j < n and ids[j] != _RM_CLOSE:
++                j += 1
++            if j >= n:
++                break
++            spans.append((i + 1, j))  # content only; markers stay
++            i = j
++        i += 1
++    return spans
++
++
++def _rm_spans(ids):
++    """Same spans as _rm_spans_slow, found with numpy (loops over observations, not tokens)."""
++    import numpy as _np
++    arr = _np.asarray(ids, dtype=_np.int64)
++    opens = _np.flatnonzero(arr == _RM_OPEN)
++    closes = _np.flatnonzero(arr == _RM_CLOSE)
++    spans, end = [], -1
++    for o in opens.tolist():
++        if o <= end:                       # inside the previous span: skipped, as in the token loop
++            continue
++        k = int(_np.searchsorted(closes, o + 1))
++        if k >= len(closes):               # unclosed observation: stop, as in the token loop
++            break
++        c = int(closes[k])
++        spans.append((o + 1, c))
++        end = c
++    if _resid_os.environ.get("SGLANG_DS_VERIFY") == "1":
++        assert spans == _rm_spans_slow(ids), "[DS-VERIFY] _rm_spans differs from the token loop"
++    return spans
++
++
++def _rm_rewrite(ids, spans, m):
++    out, prev = [], 0
++    for a, b in spans[:m]:
++        out += ids[prev:a]
++        out += _RM_PH
++        prev = b
++    return out + ids[prev:]
+ 
+ 
+ class BaseFinishReason:
+@@ -640,6 +697,12 @@ class Req:
+         self,
+         tree_cache: Optional[BasePrefixCache] = None,
+     ):
++        if _RM_ON and tree_cache is not None and not self.output_ids and not getattr(self, "_rm_done", False):
++            try:
++                self._rm_apply(tree_cache)
++            except Exception as _e:
++                print(f"[RESTORE-MASK] error: {_e}", flush=True)
++            self._rm_done = True
+         self.fill_ids = self.origin_input_ids + self.output_ids
+         if tree_cache is not None:
+             if isinstance(tree_cache, LoRARadixCache):
+@@ -663,6 +726,45 @@ class Req:
+                     key=self.adjust_max_prefix_ids(),
+                 )
+         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
++        # live KV for ObsDrop: dropped observation tokens in the matched prefix point to dead slot 0
++        if _LOG_RESID and tree_cache is not None:
++            try:
++                if hasattr(tree_cache, "ds_dead_on_path") and self.last_node is not None:
++                    _dead = tree_cache.ds_dead_on_path(self.last_node)      # fast ObsDrop: CPU count, no GPU read
++                    if _resid_os.environ.get("SGLANG_DS_VERIFY") == "1" and len(self.prefix_indices):
++                        _g = int((self.prefix_indices == 0).sum().item())
++                        assert _g == _dead, f"[DS-VERIFY] request dead cpu {_dead} != gpu {_g}"
++                else:
++                    _dead = int((self.prefix_indices == 0).sum().item()) if len(self.prefix_indices) else 0
++                self._ds_dead = _dead          # fast ObsDrop: dead slots this request carries (fixed until it finishes)
++                if not getattr(self, "_resid_logged", False):
++                    print(f"[RESID] t={time.time():.3f} rid={self.rid} prompt={len(self.origin_input_ids)} dead={_dead}", flush=True)
++                    self._resid_logged = True
++            except Exception:
++                self._ds_dead = None
++
++    def _rm_apply(self, tree_cache):
++        ids = list(self.origin_input_ids)
++        spans = _rm_spans(ids)
++        if not spans:
++            return
++        key = hash(tuple(ids[: spans[0][0]]))  # system + task + first tool call: stable for the conversation
++        m = _RM_MASKED.get(key, 0)
++        d = max(0, len(spans) - _RM_K)  # observations outside the window (dropped from the KV)
++        new = _rm_rewrite(ids, spans, min(m, len(spans)))
++        if d > m:
++            # restore needed if the cached prefix ends before the last dropped observation
++            sp = _rm_spans(new)
++            self.fill_ids = new
++            hit = len(tree_cache.match_prefix(key=self.adjust_max_prefix_ids())[0])
++            if hit < sp[d - 1][1]:
++                new = _rm_rewrite(ids, spans, d)
++                _RM_MASKED[key] = m = d
++                print(f"[RESTORE-MASK] t={time.time():.3f} rid={self.rid} hit={hit} masked={d}/{len(spans)} "
++                      f"prompt {len(ids)} -> {len(new)}", flush=True)
++        if len(new) != len(ids):
++            self.origin_input_ids = new
++            self.origin_input_ids_unpadded = list(new)
+ 
+     def adjust_max_prefix_ids(self):
+         self.fill_ids = self.origin_input_ids + self.output_ids
+@@ -1749,7 +1851,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+         global bid
+         bid += 1
+-        return ModelWorkerBatch(
++        _mwb = ModelWorkerBatch(
+             bid=bid,
+             forward_mode=self.forward_mode,
+             input_ids=self.input_ids,
+@@ -1799,6 +1901,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             launch_done=self.launch_done,
+             is_prefill_only=self.is_prefill_only,
+         )
++        # fast ObsDrop: CPU dead-slot count per request, in batch order (None = unknown, backend filters on GPU)
++        if _LOG_RESID:
++            _dd = [getattr(r, "_ds_dead", None) for r in self.reqs]
++            _mwb.ds_dead = None if any(d is None for d in _dd) else _dd
++        return _mwb
+ 
+     def copy(self):
+         # Only contain fields that will be used by process_batch_result
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index de2ad07..8aab721 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -829,6 +829,61 @@ class Scheduler(
+             initialize_moe_config(self.server_args)
+ 
+     @DynamicGradMode()
++    def _deadslot_prune(self):
++        # DEADSLOT PoC (concurrency): prune RUNNING requests over budget SGLANG_PRUNE_C by freeing a
++        # middle SGLANG_PRUNE_FRAC of each request's PRIVATE region (positions >= prefix_len). We edit
++        # only the per-request slot map (req_to_token): redirect pruned positions to the reserved dummy
++        # slot 0, then free the real private slots. Protected radix-prefix slots are never freed
++        # (rule (a)), so allocator/radix accounting stays consistent. Frees live KV -> more concurrency.
++        import os
++        _c = os.environ.get("SGLANG_PRUNE_C")
++        if not _c:
++            return
++        try:
++            _C = int(_c)
++            _frac = float(os.environ.get("SGLANG_PRUNE_FRAC", "0.4"))
++            _alloc = self.token_to_kv_pool_allocator
++            _r2t = self.req_to_token_pool.req_to_token
++            if not getattr(self, "_ds_masked", False):
++                _kv = _alloc.get_kvcache()
++                for _l in range(_kv.layer_num):
++                    _kv.k_buffer[_l][0] = -1e4
++                    _kv.v_buffer[_l][0] = 0
++                self._ds_masked = True
++            _freed = 0
++            for _req in self.running_batch.reqs:
++                if getattr(_req, "_ds_pruned", False):
++                    continue
++                _N = len(_req.origin_input_ids) + len(_req.output_ids)
++                if _N <= _C:
++                    continue
++                _idx = _req.req_pool_idx
++                _plen = len(_req.prefix_indices)  # protected shared prefix -> never freed
++                _pn = _N - _plen
++                if _pn < 10:
++                    continue
++                _k0 = _plen + int((0.5 - _frac / 2) * _pn)
++                _k1 = _plen + int((0.5 + _frac / 2) * _pn)
++                if _k1 <= _k0:
++                    continue
++                _slots = _r2t[_idx, _k0:_k1].clone()
++                _r2t[_idx, _k0:_k1] = 0  # redirect this request's view -> dummy sentinel
++                _alloc.free(_slots)  # return the real private slots -> available for new requests
++                _freed += _k1 - _k0
++                _req._ds_pruned = True
++                _req._ds_k0 = _k0  # radix may cache only [0,k0): the sentinel-free head
++            if _freed:
++                _n = getattr(self, "_ds_logn", 0)
++                if _n < 6:
++                    self._ds_logn = _n + 1
++                    print(
++                        f"[DEADSLOT] pruned running reqs: freed {_freed} private tokens "
++                        f"-> avail={_alloc.available_size()}",
++                        flush=True,
++                    )
++        except Exception as _e:
++            print(f"[DEADSLOT] prune error: {_e}", flush=True)
++
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
+         while True:
+@@ -836,6 +891,7 @@ class Scheduler(
+             self.process_input_requests(recv_reqs)
+ 
+             batch = self.get_next_batch_to_run()
++            self._deadslot_prune()
+             self.cur_batch = batch
+ 
+             if batch:
+@@ -861,6 +917,7 @@ class Scheduler(
+             self.process_input_requests(recv_reqs)
+ 
+             batch = self.get_next_batch_to_run()
++            self._deadslot_prune()
+             self.cur_batch = batch
+ 
+             if batch:
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index aa060af..ec5408c 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -23,6 +23,8 @@ if TYPE_CHECKING:
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_FORCE_STREAM_INTERVAL = 50
++import os as _os
++_TRUE_TTFT = _os.environ.get("SGLANG_TRUE_TTFT", "0") == "1"
+ 
+ 
+ class SchedulerOutputProcessorMixin:
+@@ -586,6 +588,9 @@ class SchedulerOutputProcessorMixin:
+                 else:
+                     should_output = (
+                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
++                        # true TTFT for non-stream requests: also emit the 1st token so the
++                        # tokenizer manager timestamps it (default only emits every 50 tokens)
++                        or (_TRUE_TTFT and len(req.output_ids) == 1)
+                         if not self.model_config.is_multimodal_gen
+                         else False
+                     )
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 5674bb4..da8f999 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -105,6 +105,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+ 
+ logger = logging.getLogger(__name__)
++_LOG_TTFT = os.environ.get("SGLANG_LOG_TTFT", "0") == "1"
+ 
+ 
+ @dataclasses.dataclass
+@@ -1634,6 +1635,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+             self.metrics_collector.observe_time_to_first_token(
+                 labels, state.first_token_time - state.created_time
+             )
++            if _LOG_TTFT:
++                logger.info(
++                    f"[TTFT] t={state.first_token_time:.3f} ttft={state.first_token_time - state.created_time:.4f} rid={getattr(state.obj, 'rid', None)} "
++                    f"prompt={recv_obj.prompt_tokens[i]} cached={recv_obj.cached_tokens[i] if getattr(recv_obj, 'cached_tokens', None) else -1}"
++                )
+         else:
+             num_new_tokens = completion_tokens - state.last_completion_tokens
+             if num_new_tokens:
+@@ -1647,6 +1653,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
+                 state.last_time = new_time
+                 state.last_completion_tokens = completion_tokens
+ 
++        if state.finished and _LOG_TTFT:
++            _now = time.time()
++            logger.info(
++                f"[DONE] t={_now:.3f} e2e={_now - state.created_time:.4f} "
++                f"prompt={recv_obj.prompt_tokens[i]} completion={completion_tokens}"
++            )
++            _ct = recv_obj.cached_tokens[i] if getattr(recv_obj, "cached_tokens", None) else 0
++            logger.info(
++                "[REQ] " + json.dumps({"t": round(state.created_time, 3), "rid": getattr(state.obj, "rid", None),
++                                       "latency_s": round(_now - state.created_time, 3), "prompt": recv_obj.prompt_tokens[i],
++                                       "cached": _ct, "output": completion_tokens,
++                                       "ttft_s": round(state.first_token_time - state.created_time, 4) if state.first_token_time else None})
++            )
++
+         if state.finished:
+             has_grammar = (
+                 state.obj.sampling_params.get("json_schema", None)
+diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
+index 4973316..ea99de9 100644
+--- a/python/sglang/srt/mem_cache/allocator.py
++++ b/python/sglang/srt/mem_cache/allocator.py
+@@ -20,12 +20,22 @@ Page-aligned memory pool.
+ """
+ 
+ import abc
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+ import triton
+ import triton.language as tl
+ 
++# DEADSLOT PoC: when enabled, index 0 (SGLang's reserved dummy slot) is used as the dead-slot
++# sentinel; it must never enter the free list, so free() filters it out.
++_DEADSLOT_ON = bool(
++    os.environ.get("SGLANG_DROP_ON_FINISH")
++    or os.environ.get("SGLANG_DROP_EVERY")
++    or os.environ.get("SGLANG_PRUNE_C")
++    or os.environ.get("SGLANG_OBS_WINDOW")
++)
++
+ from sglang.srt.mem_cache.memory_pool import SWAKVPool
+ from sglang.srt.utils import get_bool_env_var, next_power_of_2
+ 
+@@ -154,6 +164,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         return select_index
+ 
+     def free(self, free_index: torch.Tensor):
++        if _DEADSLOT_ON and free_index.numel() > 0:
++            free_index = free_index[free_index != 0]  # never free the dead-slot sentinel (idx 0)
+         if free_index.numel() == 0:
+             return
+ 
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index d8208e1..0659834 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -20,8 +20,23 @@ The radix tree data structure for managing the KV cache.
+ """
+ 
+ import heapq
++import os
+ import time
++_LOG_EVICT = os.environ.get("SGLANG_LOG_EVICT", "0") == "1"
+ from collections import defaultdict
++
++_DEADSLOT_FINISH = 0  # DEADSLOT PoC: counts finished requests to trigger the drop on the Nth
++# DEADSLOT: when pruning is on, sentinel slot 0 may appear inside radix node values; it holds no
++# memory, so all evictable/protected accounting must count only REAL (non-zero) slots.
++_DS_ON = bool(
++    os.environ.get("SGLANG_PRUNE_C")
++    or os.environ.get("SGLANG_DROP_ON_FINISH")
++    or os.environ.get("SGLANG_DROP_EVERY")
++    or os.environ.get("SGLANG_OBS_WINDOW")
++)
++_OBS_OPEN, _OBS_CLOSE = (int(x) for x in os.environ.get("SGLANG_OBS_MARKERS", "151665,151666").split(","))  # observation open/close token ids; default Qwen3 <tool_response>, Devstral [TOOL_RESULTS] = 7,8
++_DS_OBS_FREED = 0
++_DS_VERIFY = os.environ.get("SGLANG_DS_VERIFY") == "1"  # fast ObsDrop self-checks (slow)
+ from functools import partial
+ from typing import TYPE_CHECKING, List, Optional
+ 
+@@ -200,6 +215,109 @@ class RadixCache(BasePrefixCache):
+             value = [x for x in key]
+         return self._insert_helper(self.root_node, key, value)
+ 
++    def _ds_obs_drop(self, token_ids, keep):
++        """DEADSLOT observation window: drop the CONTENT of every tool observation except the last
++        `keep` ones from the cached KV of this finished turn. Token ids/positions stay unchanged, so
++        the next turn still matches the whole history (prefix hit); the dropped positions point to
++        dead slot 0 (excluded from attention by the backend) and their real slots are freed."""
++        global _DS_OBS_FREED
++        if token_ids.count(_OBS_OPEN) <= keep:              # nothing can fall out of the window: skip the scan
++            return
++        import bisect
++        import numpy as np
++
++        def _find(tok):                                   # all positions of `tok`, located with list.index (C speed)
++            out, i = [], -1
++            while True:
++                try:
++                    i = token_ids.index(tok, i + 1)
++                except ValueError:
++                    return out
++                out.append(i)
++
++        opens, closes = _find(_OBS_OPEN), _find(_OBS_CLOSE)
++        if not opens or not closes:
++            return
++        spans = []
++        for o in opens:                                   # first close after each open (same pairing as before)
++            k = bisect.bisect_left(closes, o + 1)
++            if k < len(closes) and closes[k] > o + 1:
++                spans.append((o + 1, closes[k]))          # content only; markers stay
++        drop = spans[: max(0, len(spans) - keep)]
++        if not drop:
++            return
++        last = drop[-1][1]                                # no node past the last dropped position is needed
++        chain, node, pos, N, ps = [], self.root_node, 0, len(token_ids), max(1, int(getattr(self, "page_size", 1)))
++        while pos < min(N, last):
++            child = node.children.get(self.get_child_key_fn(token_ids[pos : pos + ps]))
++            if child is None or child.value is None:
++                break
++            klen = len(child.key)
++            if pos + klen > N or token_ids[pos + klen - 1] != child.key[-1]:   # the path was just inserted: cheap check
++                break
++            chain.append((pos, child))
++            pos += klen
++            node = child
++        if not chain:
++            return
++        span_len = pos                                    # positions covered by the matched chain
++        mask = np.zeros(span_len, dtype=bool)
++        for a, b in drop:
++            if a < span_len:
++                mask[a : min(b, span_len)] = True
++        recs = []
++        for start, nd in chain:                           # one dead array for the whole chain
++            L = len(nd.value)
++            dm = getattr(nd, "_ds_dead", None)
++            if dm is None or len(dm) != L:                # no record yet: the node has no dead slots
++                dm = np.zeros(L, dtype=bool)
++                if _DS_VERIFY:
++                    assert int((nd.value == 0).sum()) == 0, "[DS-VERIFY] node without a record holds dead slots"
++                nd._ds_dead, nd._ds_ndead = dm, 0
++            recs.append(dm)
++        new_all = mask & ~np.concatenate(recs)            # positions not dropped in an earlier turn
++        freed, parts = 0, []
++        if not new_all.any():                             # steady state: everything outside the window is already dead
++            return
++        for start, nd in chain:
++            L = len(nd.value)
++            new = new_all[start : start + L]
++            if not new.any():
++                continue
++            loc = torch.from_numpy(np.flatnonzero(new)).to(nd.value.device)
++            parts.append(nd.value[loc].clone())
++            nd.value[loc] = 0
++            n = int(new.sum())
++            if nd.lock_ref > 0:
++                self.protected_size_ -= n
++            else:
++                self.evictable_size_ -= n
++            nd._ds_dead = nd._ds_dead | new
++            nd._ds_ndead = int(nd._ds_dead.sum())
++            nd._rl = None
++            freed += n
++        if parts:
++            allv = torch.cat(parts)
++            if _DS_VERIFY:                                   # every newly dropped slot must have been real
++                nz = int((allv == 0).sum())
++                assert nz == 0, f"[DS-VERIFY] {nz} already-dead slots in a new drop"
++            self.token_to_kv_pool_allocator.free(allv)
++        _DS_OBS_FREED += freed
++        try:
++            import torch.distributed as _d
++            # plain TP: every rank holds the same radix tree, print once. DP-attention (SGLANG_DP_STICKY):
++            # each DP rank has its own tree and drops independently, so every rank prints its own drops.
++            r0 = (not _d.is_initialized()) or _d.get_rank() == 0 or os.environ.get("SGLANG_DP_STICKY") == "1"
++        except Exception:
++            r0 = True
++        if r0 and freed:
++            print(
++                f"[DEADSLOT-OBS] turn end: {len(spans)} observations, kept last {keep}, dropped "
++                f"{len(drop)} -> freed {freed} KV tokens (cumulative {_DS_OBS_FREED}), "
++                f"avail={self.token_to_kv_pool_allocator.available_size()} t={time.time():.3f}",
++                flush=True,
++            )
++
+     def cache_finished_req(self, req: Req):
+         """Cache request when it finishes."""
+         if self.disable:
+@@ -210,6 +328,35 @@ class RadixCache(BasePrefixCache):
+             self.req_to_token_pool.free(req.req_pool_idx)
+             return
+ 
++        # DEADSLOT: a pruned request has sentinel(0) holes in its slot map; do NOT insert it into the
++        # radix tree (that would count sentinel slots as evictable and corrupt accounting). Free ONLY
++        # its private kept slots [prefix_len : N-1] (allocator filters slot 0); the shared radix-prefix
++        # slots [0:prefix_len) are owned by the tree and MUST NOT be freed here (double-free). Release
++        # the prefix lock so the tree can manage it.
++        # DEADSLOT: head-only path superseded by real-count accounting (_rl). With it, the NORMAL
++        # path below caches the FULL length (sentinel 0s included) exactly like the paper, so the
++        # next turn matches the whole history. Disabled (kept for reference).
++        if False and getattr(req, "_ds_pruned", False):
++            # Radix-ON variant: cache ONLY the sentinel-free head [0,k0) (shared session prefix +
++            # kept private head) so later turns still HIT the prefix, while no sentinel ever enters
++            # the tree (evictable accounting stays exact). Free everything from k0 onward.
++            _plen = len(req.prefix_indices)
++            _end = len(req.origin_input_ids) + len(req.output_ids) - 1
++            _k0 = getattr(req, "_ds_k0", None)
++            if _k0 is None or _k0 < _plen:
++                _k0 = _plen
++            token_ids = (req.origin_input_ids + req.output_ids)[:-1]
++            kv_full = self.req_to_token_pool.req_to_token[req.req_pool_idx, :_end]
++            head_kv = kv_full[:_k0].to(dtype=torch.int64, copy=True)
++            new_prefix_len = self.insert(token_ids[:_k0], head_kv)
++            # [prefix_len, new_prefix_len) duplicates already-cached content -> free req's copy
++            self.token_to_kv_pool_allocator.free(kv_full[_plen:new_prefix_len])
++            # tail [k0, end): kept private slots + pruned sentinel 0s (filtered) -> free
++            self.token_to_kv_pool_allocator.free(kv_full[_k0:_end])
++            self.req_to_token_pool.free(req.req_pool_idx)
++            self.dec_lock_ref(req.last_node)
++            return
++
+         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+         kv_indices = self.req_to_token_pool.req_to_token[
+             req.req_pool_idx, : len(token_ids)
+@@ -233,6 +380,54 @@ class RadixCache(BasePrefixCache):
+             kv_indices[len(req.prefix_indices) : new_prefix_len]
+         )
+ 
++        # DEADSLOT PoC (memory-freeing): when a LARGE request finishes, FREE ~SGLANG_DROP_FRAC of its
++        # cached KV. Redirect those radix slots to the reserved dummy slot 0, then return the real
++        # physical slots to the allocator. Token ids + radix key stay identical (prefix still matches
++        # -> radix hit preserved), and the freed slots become available -> more concurrency.
++        # SGLANG_DROP_EVERY=1 -> drop on every big finish; else SGLANG_DROP_ON_FINISH=N -> Nth only.
++        global _DEADSLOT_FINISH
++        _minlen = int(os.environ.get("SGLANG_DROP_MINLEN", "1000"))
++        _on = os.environ.get("SGLANG_DROP_ON_FINISH")
++        _every = os.environ.get("SGLANG_DROP_EVERY")
++        _node = getattr(req, "last_node", None)
++        _nodeval = getattr(_node, "value", None) if _node is not None else None
++        if (_on or _every) and _nodeval is not None and len(_nodeval) >= _minlen:
++            _DEADSLOT_FINISH += 1
++            _fire = bool(_every) or (_on and _DEADSLOT_FINISH == int(_on))
++            if _fire:
++                try:
++                    _frac = float(os.environ.get("SGLANG_DROP_FRAC", "0.4"))
++                    _v = _node.value
++                    _n = len(_v)
++                    _k0 = int((0.5 - _frac / 2) * _n)
++                    _k1 = int((0.5 + _frac / 2) * _n)
++                    _pool = self.token_to_kv_pool_allocator.get_kvcache()
++                    if not getattr(self, "_deadslot_masked", False):
++                        for _l in range(_pool.layer_num):
++                            _pool.k_buffer[_l][0] = -1e4  # mask dummy slot 0 once (redirect target)
++                            _pool.v_buffer[_l][0] = 0
++                        self._deadslot_masked = True
++                    _old = _v[_k0:_k1].clone()
++                    _v[_k0:_k1] = 0  # redirect radix slots -> dummy sentinel (before freeing reals)
++                    self.token_to_kv_pool_allocator.free(_old)  # return real slots -> concurrency
++                    if _DEADSLOT_FINISH <= 3 or _DEADSLOT_FINISH % 25 == 0:
++                        print(
++                            f"[DEADSLOT] finish#{_DEADSLOT_FINISH}: FREED {_k1 - _k0}/{_n} tokens "
++                            f"({_frac * 100:.0f}% mid) -> avail={self.token_to_kv_pool_allocator.available_size()}",
++                            flush=True,
++                        )
++                except Exception as _e:
++                    print(f"[DEADSLOT] error: {_e}", flush=True)
++
++        # DEADSLOT observation window (SGLANG_OBS_WINDOW=K): K-1 kept here + the next turn's new
++        # observation = exactly K verbatim observations visible at every model call.
++        _ow = os.environ.get("SGLANG_OBS_WINDOW")
++        if _ow:
++            try:
++                self._ds_obs_drop(token_ids[:page_aligned_len], max(0, int(_ow) - 1))
++            except Exception as _e:
++                print(f"[DEADSLOT-OBS] error: {_e}", flush=True)
++
+         # Remove req slot release the cache lock
+         self.req_to_token_pool.free(req.req_pool_idx)
+         self.dec_lock_ref(req.last_node)
+@@ -308,7 +503,7 @@ class RadixCache(BasePrefixCache):
+                 continue
+ 
+             self.token_to_kv_pool_allocator.free(x.value)
+-            num_evicted += len(x.value)
++            num_evicted += self._rl(x)
+             self._delete_leaf(x)
+ 
+             if len(x.parent.children) == 0:
+@@ -316,6 +511,38 @@ class RadixCache(BasePrefixCache):
+ 
+             self._record_remove_event(x)
+ 
++        if _LOG_EVICT and num_evicted > 0:
++            print(
++                f"[EVICT] t={time.time():.3f} requested={num_tokens} evicted={num_evicted} "
++                f"evictable_left={self.evictable_size_} protected={self.protected_size_}",
++                flush=True,
++            )
++
++    def _rl(self, node):
++        # DEADSLOT: real (non-sentinel) slot count of a node; cached on the node, reset on split.
++        if not _DS_ON:
++            return len(node.value)
++        r = getattr(node, "_rl", None)
++        if r is None:
++            v = node.value
++            if v is None:
++                return 0
++            # fast ObsDrop: dead slots only come from _ds_obs_drop, which keeps a CPU count per node -> no GPU read
++            r = len(v) - getattr(node, "_ds_ndead", 0)
++            if _DS_VERIFY and torch.is_tensor(v):
++                g = int((v != 0).sum().item())
++                assert g == r, f"[DS-VERIFY] _rl cpu {r} != gpu {g}"
++            node._rl = r
++        return r
++
++    def ds_dead_on_path(self, node):
++        """fast ObsDrop: dead slots in the prefix ending at `node` (sum of the CPU counts along the path)."""
++        c = 0
++        while node is not None and node is not self.root_node:
++            c += getattr(node, "_ds_ndead", 0)
++            node = node.parent
++        return c
++
+     def inc_lock_ref(self, node: TreeNode):
+         if self.disable:
+             return 0
+@@ -323,9 +550,10 @@ class RadixCache(BasePrefixCache):
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 0:
+-                self.evictable_size_ -= len(node.value)
+-                self.protected_size_ += len(node.value)
+-                delta -= len(node.value)
++                _n = self._rl(node)
++                self.evictable_size_ -= _n
++                self.protected_size_ += _n
++                delta -= _n
+             node.lock_ref += 1
+             node = node.parent
+         return delta
+@@ -337,9 +565,10 @@ class RadixCache(BasePrefixCache):
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 1:
+-                self.evictable_size_ += len(node.value)
+-                self.protected_size_ -= len(node.value)
+-                delta += len(node.value)
++                _n = self._rl(node)
++                self.evictable_size_ += _n
++                self.protected_size_ -= _n
++                delta += _n
+             node.lock_ref -= 1
+             node = node.parent
+         return delta
+@@ -401,6 +630,11 @@ class RadixCache(BasePrefixCache):
+         child.parent = new_node
+         child.key = child.key[split_len:]
+         child.value = child.value[split_len:]
++        child._rl = None  # DEADSLOT: real-length cache invalid after split (new_node computes lazily)
++        _dm = getattr(child, "_ds_dead", None)  # fast ObsDrop: CPU record of dead positions follows the values
++        if _dm is not None:
++            new_node._ds_dead, child._ds_dead = _dm[:split_len], _dm[split_len:]
++            new_node._ds_ndead, child._ds_ndead = int(new_node._ds_dead.sum()), int(child._ds_dead.sum())
+         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+ 
+         self._record_store_event(new_node)
+@@ -437,7 +671,7 @@ class RadixCache(BasePrefixCache):
+             new_node.key = key
+             new_node.value = value
+             node.children[child_key] = new_node
+-            self.evictable_size_ += len(value)
++            self.evictable_size_ += self._rl(new_node)
+             self._record_store_event(new_node)
+         return total_prefix_length
+ 
+@@ -464,7 +698,7 @@ class RadixCache(BasePrefixCache):
+             if v == node:
+                 break
+         del node.parent.children[k]
+-        self.evictable_size_ -= len(node.key)
++        self.evictable_size_ -= self._rl(node)
+ 
+     def _total_size_helper(self):
+         total_size = 0
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 017b586..d64efa1 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -317,6 +317,13 @@ class ForwardBatch:
+     ):
+         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+ 
++        if hasattr(batch, "ds_dead"):  # fast ObsDrop: dead counts for this forward, read by the FlashInfer backend
++            from sglang.srt.layers.attention import flashinfer_backend as _fb
++            _sl = batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else None
++            _fb._DS_CUR = None if (batch.ds_dead is None or _sl is None) else dict(
++                dead=batch.ds_dead, seq=_sl,
++                prefix=list(batch.extend_prefix_lens) if batch.extend_prefix_lens is not None else None)
++
+         ret = cls(
+             forward_mode=batch.forward_mode,
+             batch_size=len(batch.seq_lens),
