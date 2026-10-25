@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obsdrop-vllm"
+version = "0.1"
+description = "ObsDrop for official vLLM: drop the KV of old tool outputs while keeping the prefix-cache hit"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+obsdrop = "obsdrop_vllm:register"
+
+[tool.setuptools]
+packages = ["obsdrop_vllm"]
